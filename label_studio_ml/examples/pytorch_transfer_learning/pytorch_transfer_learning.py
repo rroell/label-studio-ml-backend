@@ -99,7 +99,7 @@ class ImageClassifier(object):
 
     def load(self, path):
         self.model.load_state_dict(torch.load(path))
-        self.model.eval()
+        # self.model.eval()
 
     def predict(self, image_urls):
         images = torch.stack([get_transformed_image(url) for url in image_urls]).to(device)
