@@ -1,5 +1,4 @@
 # ©RoelDuijsings
-from cProfile import label
 import json
 import os
 import requests
@@ -35,6 +34,12 @@ def convert_to_local_path(ls_path):
     image_path = os.path.join(UNLABALED_DIR, image_name)
     return image_path
 
+def calculate_uncertainty(top_probs):
+    # SMALLEST MARGIN UNCERTAINTY (SMU) P(max)-P(max-1)
+    first = top_probs[0][0].item()
+    second = top_probs[0][1].item()
+    margin = first - second
+    return 1 - margin
 
 
 class CLIPDataset(Dataset):
@@ -82,21 +87,9 @@ class CLIPImageClassifier(object):
         self.model.eval()
         
     def predict(self, image_path, labels):
-        # for path in image_paths:
-        #     print(path)
-        print("IMAGE:")
-        print(image_path)
-        print()
-        # images = torch.stack([(self.preprocess(Image.open(path))) for path in image_path]).to(device)
-        # labels = clip.tokenize(labels).to(device)
         image = self.preprocess(Image.open(image_path)).unsqueeze(0).to(device) # TODO: now image per image, but can insert multiple images as a list to the model. The problem you're facing is related to the fact that your CLIP model is expecting a batch of images, but you're giving it a single image.In PyTorch, models expect inputs to have a batch dimension, even if there's only one item in the batch. In other words, if you're providing a single image, it still needs to be presented as a batch of size 1.
-        print("Image shape:", image.shape)
-
-        with torch.no_grad():
-            logits_per_image, logits_per_text = self.model(image, labels)
-        print("Finished model prediction")
+        logits_per_image, logits_per_text = self.model(image, labels)
         return logits_per_image.to(device), logits_per_text.to(device)
-
     
     def train(self, dataloader, num_epochs=20):
         since = time.time()
@@ -162,10 +155,7 @@ class CLIPImageClassifierAPI(LabelStudioMLBase):
             self.parsed_label_config, 'Choices', 'Image')
         
     def predict(self, tasks, **kwargs):
-        # ls_image_paths = [task['data'][self.value] for task in tasks]
-        # image_paths = [convert_to_local_path(ls_path) for ls_path in ls_image_paths]        # TODO: image paths to local image paths
-        # print("Image paths:\n", image_paths)
-
+        print("Start predicting!")
         labels = self.classes
         labels = clip.tokenize(labels).to(device)
 
@@ -175,16 +165,15 @@ class CLIPImageClassifierAPI(LabelStudioMLBase):
                 ls_image_path = task['data'][self.value]
                 image_path = convert_to_local_path(ls_image_path)
                 
-                print("This image:", image_path)
+                # print("This image:", image_path)
                 logits_per_image, logits_per_label = self.model.predict(image_path, labels)
 
-                print("Calc pred..")
+                # print("Calc pred..")
                 probs = logits_per_image.softmax(dim=-1) #take the softmax to get the label probabilities
                 k = min(5, len(self.classes)) # TODO: now only 2 classes
                 top_probs, top_labels_indices = probs.topk(k=k, dim=-1) # returns values,indices
 
                 topk_labels = [self.classes[id] for id in top_labels_indices[0]] # the top k predicted labels
-                print(topk_labels)
 
                 top_score = top_probs[0][0].item()
                 predicted_label = topk_labels[0]
@@ -193,18 +182,17 @@ class CLIPImageClassifierAPI(LabelStudioMLBase):
                     'from_name': self.from_name,
                     'to_name': self.to_name,
                     'type': 'choices',
-                    'value': {'choices': [predicted_label]}
+                    'value': {'choices': [predicted_label]},
+                    'topk_labels': topk_labels,
                 }]
                 
-                # expand predictions with their scores for all tasks
-                predictions.append({'result': result, 'score': float(top_score)})
+                uncertainty_score = calculate_uncertainty(top_probs)
+                predictions.append({'result': result, 'score': uncertainty_score}) #'score': float(top_score)})
 
-                # uncertainty_score = calculate_uncertainty(top_probs)
-                # list_uncertainty.append((path, true_label, topk_labels, top_probs, uncertainty_score))
-
+        print("Finished predicting!")
         return predictions
 
-    def fit(self, annotations, workdir=None, batch_size=10, num_epochs=20, **kwargs):
+    def fit(self, annotations, workdir=None, batch_size=10, num_epochs=10, **kwargs):
         image_paths, image_labels = [], []
         print('Collecting annotations...')
         
@@ -212,7 +200,6 @@ class CLIPImageClassifierAPI(LabelStudioMLBase):
         if kwargs.get('data'):
             project_id = kwargs['data']['project']['id']
             tasks = self._get_annotated_dataset(project_id)
-            # print(f"tasks: {tasks}")
         # ML training without web hook
         else:
             tasks = annotations
@@ -227,24 +214,11 @@ class CLIPImageClassifierAPI(LabelStudioMLBase):
             if annotation.get('skipped') or annotation.get('was_cancelled'):
                 continue
             
-            # extract image name and join with unlabeled dir to get local image_path
-            # image_name= task['data']['image'].split('-')[1]
-            # image_path = os.path.join(UNLABALED_DIR, image_name )
-
             ls_path =  task['data']['image']
             image_path = convert_to_local_path(ls_path)
-            image_paths.append(image_path)
-
-            
+            image_paths.append(image_path)           
             image_labels.append(annotation['result'][0]['value']['choices'][0])
         
-        print()
-        [print(img, label) for img, label in zip(image_paths ,image_labels)]
-        # print(image_labels)
-        print()
-
-
-
         print(f'Creating dataset with {len(image_paths)} images...')
         dataset = CLIPDataset(image_paths, image_labels, self.model.preprocess)
         dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size)
@@ -257,6 +231,7 @@ class CLIPImageClassifierAPI(LabelStudioMLBase):
         model_path = os.path.join(workdir, 'model.pt')
         self.model.save(model_path)
         print("Finish saving.")
+        print("--- Finished training! ---")
 
         return {'model_path': model_path, 'classes': dataset.classes}
 
